@@ -1,124 +1,138 @@
-# ATAC-seq of CREBBP-mutant cells treated with HDAC inhibitors
+# Multi-omics of cisplatin-resistant small cell lung cancer
 
-Raw-data processing, quality control, *Drosophila* spike-in quantification and a first differential accessibility analysis of 21 shallow-sequenced ATAC-seq libraries. The cells are a CREBBP-mutant line (**CR**) and its parental line (**P**), each treated with three HDAC inhibitors or left untreated. The question for this QC run was: *which libraries are good enough to send for deep sequencing, and is the CR vs P difference already visible?*
+Is cisplatin resistance in small cell lung cancer (SCLC) written in the genome or in the chromatin? Can HDAC inhibitors reverse it? We profiled the **H1694** SCLC line, parental (**P**) and a stable cisplatin-resistant derivative (**CR**), with three sequencing assays and integrated them:
 
-All processing ran on a university HPC server as part of an MSc practical (Genomics & Transcriptomics, IMC Krems, 2026). This repository holds the methods, the per-sample QC summary, the spike-in fractions, the significant peaks and the figures. The reads, BAMs, peak files and count matrix are not included (see [Data](#data)).
+- **WGS** to test for an acquired genetic driver
+- **RNA-seq** to measure the transcriptional programme of resistance and of three HDAC inhibitors
+- **ATAC-seq** to measure chromatin accessibility, with a *Drosophila* spike-in for global changes
 
-## Background
+**Result:** resistance is epigenetic. There is no acquired loss-of-function in 14 SCLC driver genes. Resistance carries a 2,544-gene expression programme, and chromatin accessibility tracks it (Wilcoxon p = 1 × 10⁻⁷), with globally more compact chromatin in CR. The three HDAC inhibitors act through distinct programmes: romidepsin and RGFP966 push the MYC/E2F/G2M cell-cycle axis in **opposite** directions.
 
-**CREBBP** is a histone acetyltransferase. Loss-of-function mutations are common in follicular and diffuse large B-cell lymphoma and are expected to reduce histone acetylation and compact chromatin. **HDAC inhibitors** push the balance back towards acetylation, so they are a rational therapy for CREBBP-mutant tumours. Three were tested:
+Laboratory report for the PAGI2LB course, MSc Bioinformatics, IMC Krems, July 2026, by F. Cazorla, J. Jerónimo and M. Solano (Group 7). Libraries were prepared by seven student groups and sequenced as one pool. This repository summarises the pooled analysis. The [`atac/`](atac/) folder holds my own ATAC-seq processing and QC in full.
 
-| Code | Drug | Class |
+## Study design
+
+2 cell states (P, CR) × 4 arms, with the control arm most heavily replicated:
+
+| Arm | Drug | Selectivity | RNA-seq libraries |
+|---|---|---|---|
+| Co | vehicle | | 12 |
+| Romi | romidepsin (FK228) | class I, HDAC1/2 | 6 |
+| Vor | vorinostat (SAHA) | pan-HDAC | 5 |
+| RGFP | RGFP966 | HDAC3-selective | 4 |
+
+| Assay | Libraries | Kit | Depth |
+|---|---|---|---|
+| RNA-seq | 27 | NEBNext UltraExpress RNA + poly(A) module | 3.6–36.9 M reads, 75 bp |
+| ATAC-seq | 21 | Active Motif ATAC-Seq Express + *Drosophila* spike-in | 0.08–1.2 M reads, 75 bp |
+| WGS | 2 (P, CR) | NEBNext UltraExpress FS DNA | 962 M (46×) / 504 M (24×), 150 bp |
+
+Sequencing ran paired-end on an Element Biosciences AVITI.
+
+## Analysis
+
+All layers use GRCh38 with Ensembl gene models, so genes, peaks and variants share one annotation key.
+
+| Layer | Pipeline | Key settings |
 |---|---|---|
-| Co | none (control) | |
-| RGFP | RGFP966 | HDAC3-selective (class I) |
-| Romi | Romidepsin | class I |
-| Vor | Vorinostat | pan-HDAC |
+| QC | FastQC, fastp, STAR/Qualimap, Picard/samtools → MultiQC | |
+| RNA-seq | STAR → featureCounts → DESeq2 | design `~ resistance + condition`; DE = padj < 0.05 and \|log2FC\| ≥ 1 |
+| Enrichment | clusterProfiler | GSEA ranked by the DESeq2 Wald statistic; ORA; MSigDB Hallmark + GO-BP |
+| ATAC-seq | Bowtie2 → MACS3 → featureCounts → DESeq2 | dm6 spike-in for the global metric, median-of-ratios for per-peak tests; edgeR cross-check |
+| WGS | BWA → GATK HaplotypeCaller → bcftools → SnpEff | germline P vs CR, QUAL ≥ 30 and DP ≥ 10, GRCh38.99 |
+| Integration | peak → gene via TxDb, joined on Ensembl ID | LFC correlation, sign test, Wilcoxon; WGS as a genetic-confound filter |
 
-Three biological replicates per condition were planned (24 libraries). Three are missing (CR_Co_r1, P_Co_r1, P_Romi_r1), so there are 21.
-
-**Spike-in.** A fixed amount of *Drosophila melanogaster* chromatin was added to every sample before tagmentation. If a sample has less accessible human chromatin, fly reads make up a larger share of its library. Library-size normalisation hides this kind of global change; the spike-in fraction reveals it.
-
-## Pipeline
-
-```
-FASTQ ──fastp──▶ trimmed ──Bowtie2 (GRCh38 + dm6)──▶ BAM ──samtools fixmate/markdup──▶ filtered BAM
-                                                        │                                 │
-                                                        └─ samtools idxstats ─▶ spike-in   ├─ deepTools: fragment sizes, TSS enrichment, bigWig
-                                                                                            ├─ MACS3 (BAMPE) ─▶ peaks ─▶ FRiP, consensus peaks
-                                                                                            └─ featureCounts ─▶ peak × sample counts ─▶ edgeR
-```
-
-| Step | Tool | Key settings |
-|---|---|---|
-| Reference | GENCODE GRCh38 primary (v50) + FlyBase dm6 (r6.68) | fly contigs prefixed `dm6_`; ENCODE blacklist ENCFF356LFX |
-| Trimming | fastp 1.3.5 | `--detect_adapter_for_pe --length_required 20` |
-| Alignment | Bowtie2 | `--no-mixed --no-discordant --maxins 2000` |
-| Duplicates | samtools | name-sort → `fixmate -m` → coordinate sort → `markdup` |
-| Filtering | samtools | `-f 2 -F 1804 -q 30`, human nuclear chromosomes only (no chrM, no `dm6_`) |
-| Spike-in | samtools idxstats | fly reads / (human + fly reads), on the aligned BAM |
-| Fragment sizes | deepTools 3.5.6 `bamPEFragmentSize` | max 800 bp |
-| TSS enrichment | deepTools `computeMatrix reference-point` + `plotProfile` | ±2 kb, 10 bp bins, RPKM bigWigs |
-| Peaks | MACS3 3.0.4 | `-f BAMPE --nomodel --nolambda --keep-dup all` |
-| FRiP | bedtools intersect | reads in the sample's own peaks / filtered reads |
-| Complexity | preseq `lc_extrap` | on duplicate-marked BAMs |
-| Consensus peaks | bedtools merge | all 21 narrowPeak files → 97,042 regions |
-| Counting | featureCounts 2.1.1 | `-F SAF -p --countReadPairs` |
-| Differential accessibility | edgeR (quasi-likelihood F-test) | design `~ treatment + condition`; keep peaks with CPM > 1 in ≥ 3 samples (38,748); TMM |
-
-[`docs/pipeline.md`](docs/pipeline.md) writes out each step as commands, rebuilt from the parameters recorded in the lab report.
+Modelling resistance as a covariate absorbs the dominant P/CR axis, so each drug can be tested against its own control.
 
 ## Results
 
-### Library QC
+### Quality control
 
-Full table: [`results/qc_summary.tsv`](results/qc_summary.tsv).
+| Metric (range across libraries) | RNA-seq | ATAC-seq | WGS |
+|---|---|---|---|
+| Bases ≥ Q30 | 90.7–92.8% | 90.7–93.9% | |
+| Duplication | 2.5–7.9% | 0.3–6.2% | 43–44% |
+| Adapter content | 0.8–7.8% | 11.4–60.9% | 1.0–1.4% |
+| Uniquely mapped (STAR) / mapped (samtools) | 83.3–92.7% | | 98.8–99.5% |
 
-![Fragment size distribution](plots/fragment_size.png)
-![TSS enrichment](plots/tss_enrichment.png)
+![Per-base quality](figures/qc_fastqc_per_base_quality.png)
 
-- **All 21 libraries look like ATAC-seq.** The fragment sizes show a dominant nucleosome-free peak below 100 bp and a mono-nucleosome peak near 200 bp. Every sample has a clear peak at the TSS.
-- **Depth is very shallow,** as intended for a QC run: 26k–519k reads per library after filtering.
-- **Parental libraries map well; most CR libraries don't.** All P samples except P_Vor_r3 map at 98%. CR samples map at 22–98% (median 40%). The spike-in doesn't explain this: mapped reads equal human plus fly reads, so the lost reads simply don't align to either genome. Adapter dimers or contamination are the likely causes. The MultiQC report on the server would show which.
-- **FRiP is low overall** (ENCODE recommends > 0.2). Only 7 libraries pass, all of them CR. FRiP is measured against each sample's own peaks, and some low-depth CR samples have high FRiP from few, strong peaks, so it shouldn't be compared directly between conditions.
-- **CR_Co_r3** (25,686 reads) was too shallow for preseq to estimate complexity. **CR_Co_r2** has the flattest TSS profile.
+Base quality is high for every assay. ATAC-seq is the weak layer. Its reads are shallow and adapter-rich, and its GC distribution is bimodal (30% and 48%), consistent with over-tagmentation. Only a minority of ATAC libraries showed a clean nucleosomal ladder. In our own group (Group 7), RNA inputs were intact (RINe ≈ 10), but library yields were uneven (RNA 0.03–2.5 ng/µL, ATAC 0.04–141 ng/µL), and our gDNA library failed QC. All results below therefore come from the class pool.
 
-### Spike-in
+### WGS: no genetic driver of resistance
 
-| | CR (n = 11) | P (n = 10) |
-|---|---|---|
-| Median fly fraction | 9.7% | 4.9% |
-| Range | 2.0–43.1% | 1.2–12.7% |
-
-CR libraries carry about **twice** as much fly chromatin as parental ones. This fits the expectation that CREBBP loss means less accessible chromatin, but the spread within each group is wide. CR_Romi_r2 (43%) is an outlier, and P_Vor_r3 (12.7%) is also the weakest parental library. Treat the difference as a hint, not a measurement, until the deep-sequencing data are in. Per-sample values: [`results/spikein_fractions.tsv`](results/spikein_fractions.tsv).
-
-### CR vs parental
-
-![MDS plot](plots/mds_all_samples.png)
-
-The first MDS dimension (27% of variance) separates most parental samples (right) from CR samples (left). Cell line is the main source of variation. Treatment doesn't group samples at this depth. CR samples are much more spread out than parental ones, matching their more variable QC.
-
-![MA plot](plots/ma_plot_cr_vs_p.png)
-
-Three of 38,748 peaks are significant at FDR < 0.05, all more open in CR ([`results/differential_peaks_FDR05.csv`](results/differential_peaks_FDR05.csv)):
-
-| Peak | Location (hg38) | log2FC | FDR | Nearest gene |
-|---|---|---|---|---|
-| peak_2920 | chr1:39,958,213–39,961,492 | 1.79 | 0.008 | *MFSD2A* (1.2 kb) |
-| peak_2896 | chr1:39,878,947–39,888,057 | 1.45 | 0.021 | *MYCL* / *MYCL-AS1* (overlapping) |
-| peak_39650 | chr17:38,414,672–38,416,068 | 2.25 | 0.036 | *ARHGAP23* (3.2 kb) |
-
-The MA cloud sits **above zero** (65% of peaks have log2FC > 0, median 0.34), so most peaks appear more open in CR after TMM normalisation. This conflicts with the spike-in, which points to *less* accessible chromatin in CR. TMM assumes most peaks don't change, and that assumption may not hold here. The variable mapping and depth of the CR libraries could also cause the shift. The next step is to repeat the test with spike-in-derived normalisation factors instead of TMM, and to see whether the skew and the three hits remain.
-
-### Recommendation for deep sequencing
-
-| Decision | Libraries |
+| CR-private variants | Count |
 |---|---|
-| Sequence deeply | all parental except P_Vor_r3; CR_RGFP_r1, CR_Romi_r3, CR_Vor_r3 |
-| Borderline (low depth or low FRiP) | CR_Co_r2, CR_Romi_r1, CR_Vor_r1, CR_Vor_r2, P_Vor_r3 |
-| Repeat the library | CR_Co_r3 (too shallow), CR_RGFP_r2, CR_RGFP_r3, CR_Romi_r2 (FRiP < 0.08 despite reasonable depth; CR_Romi_r2 also 43% spike-in) |
+| genome-wide | 448,562 |
+| in 14 SCLC driver genes | 187 |
+| … high confidence (QUAL ≥ 30, DP ≥ 10) | 91 |
+| … coding (SnpEff) | 1 |
+| … loss-of-function | **0** |
+
+The large genome-wide number is an artefact of comparing a 46× call set with a 24× one, not a burst of mutation. The single coding candidate is a conservative in-frame deletion in ***KMT2D*** (chr12:49,022,072, MODERATE). It is interesting because KMT2D is a histone methyltransferase, but it is weak evidence for a driver and leaves no RNA or ATAC footprint (see below).
+
+### RNA-seq: resistance dominates
+
+![RNA-seq PCA](figures/rnaseq_pca.png)
+
+PC1 explains **73%** of the variance and splits P from CR. Drugs mix within each half. CR vs P gives **2,544 DE genes**, an order of magnitude more than any drug.
+
+![CR vs P volcano](figures/rnaseq_volcano_cr_vs_p.png)
+
+One library (CR_Romi_r2_A) was a mild outlier. Dropping it cut the Romi hits from 236 to 113, but the fold changes correlated at 0.95 with no sign flips, so it was kept.
+
+### RNA-seq: three distinct drug programmes
+
+| Contrast | DE genes | up | down |
+|---|---|---|---|
+| Romi vs Co | 236 | 192 | 44 |
+| Vor vs Co | 51 | 13 | 38 |
+| RGFP vs Co | 13 | 1 | 12 |
+
+![Hallmark GSEA across drugs](figures/gsea_hallmark_nes_across_drugs.png)
+
+- **Romidepsin (HDAC1/2)** gives the full HDAC-inhibitor phenotype. Proliferation and biosynthesis shut down (MYC targets NES −2.48, E2F −2.24, G2M −1.83; telomere maintenance down). EMT, TNFα, p53 and apoptosis programmes are de-repressed.
+- **Vorinostat (pan)** is a metabolic bridge. Hypoxia, OXPHOS and MYC targets go up, and it shares romidepsin's apoptosis and TNFα de-repression, but it doesn't arrest proliferation.
+- **RGFP966 (HDAC3)** is the opposite pole: a coherent MYC/E2F/G2M biosynthesis programme goes **up**.
+
+The cell-cycle sign flip between romidepsin and RGFP966 is strongly significant (MYC padj 5 × 10⁻⁹) and internally coherent. Under-dosing would give a weaker signal in the same direction, not the opposite one, so the flip reflects mechanism rather than power. Pairwise fold-change correlations between drugs are only 0.32–0.40, so the three arms were analysed separately.
+
+### ATAC-seq: global compaction, little per-peak power
+
+The spike-in fraction is about twice as high in CR (mean 0.108 vs 0.053), so **CR chromatin is globally less accessible**. Per-peak testing is underpowered: 0 significant peaks with DESeq2, 3 with edgeR, and none in any drug contrast. Details, QC and the spike-in table are in [`atac/`](atac/README.md).
+
+### Multi-omic integration
+
+![RNA vs ATAC, CR vs P](figures/integration_cr_vs_p_rna_vs_atac.png)
+
+- **Resistance axis.** Among 765 resistance DE genes with a tested peak, genes up in CR are significantly more open in CR than genes down in CR (Wilcoxon p = 1.06 × 10⁻⁷). Per-locus coupling is weak (Pearson 0.063, 52% sign agreement), so the bias is real in aggregate while single peaks are noisy. Standard normalisation removes the global compaction, so this is gene-specific evidence on top of the spike-in shift.
+- **Drug axis.** No concordance (correlation 0.02). ATAC can't confirm the drug programmes at this depth.
+- **WGS overlay.** The *KMT2D* in-frame deletion is silent in RNA (log2FC −0.07, padj 0.26) and only mildly, non-significantly changed in ATAC (+0.60).
+
+All three layers agree: the resistance state lives in the transcriptome and chromatin, not in the driver-gene sequence. Consistent with the SCLC-N assignment of H1694, the subtype master TFs (NEUROD1, ASCL1, POU2F3) showed no notable involvement.
 
 ## Limitations
 
-- QC-depth data (< 0.6 M filtered reads per library). The differential analysis has very little power, and the three significant peaks are preliminary.
-- No control condition has more than two replicates.
-- Differential accessibility used TMM, not the spike-in. See the MA-plot discussion above.
-- FRiP values come from per-sample peaks, not the consensus set.
+- ATAC-seq is shallow (FRiP mostly < 0.2, control n = 2 per state), so chromatin evidence is aggregate, not per-locus.
+- WGS is germline-only, with no somatic caller (e.g. Mutect2 with P as normal) and no copy-number analysis. Copy gains could mimic an epigenetic change.
+- RNA-seq replication is unbalanced (12/6/5/4) and the factorial is incomplete. RGFP's coherent GSEA signal rests on n = 4.
+- One cell line, so the results don't generalise beyond H1694.
 
-## Data
-
-The libraries come from an unpublished cell-line experiment used for teaching. The FASTQ, BAM, peak and count files stay on the course server and are not redistributed here. The tables in `results/` are summaries produced on the server.
+**Next steps:** deeper or Omni-ATAC on the same pair, with TF footprinting; somatic and copy-number WGS; a functional assay testing whether romidepsin-type remodelling restores cisplatin sensitivity.
 
 ## Repository layout
 
 ```
-docs/pipeline.md     commands for each processing step
-results/             qc_summary.tsv, spikein_fractions.tsv, samplesheet.tsv, differential_peaks_FDR05.csv
-plots/               fragment sizes, TSS enrichment, MDS, MA plot
+README.md            this summary (pooled analysis)
+figures/             QC, RNA-seq, GSEA and integration figures from the report
+atac/                my ATAC-seq processing: README, pipeline.md, results/, plots/
 ```
 
-## References
+Reads, alignments and count matrices come from an unpublished teaching experiment and stay on the course server.
 
-- Buenrostro J.D. *et al.* Transposition of native chromatin for fast and sensitive epigenomic profiling of open chromatin. *Nat Methods* 10:1213–1218 (2013).
-- Pasqualucci L. *et al.* Inactivating mutations of acetyltransferase genes in B-cell lymphoma. *Nature* 471:189–195 (2011).
-- Robinson M.D., McCarthy D.J., Smyth G.K. edgeR: a Bioconductor package for differential expression analysis of digital gene expression data. *Bioinformatics* 26:139–140 (2010).
+## Key references
+
+- Solta A. *et al.* Entinostat enhances the efficacy of chemotherapy in small cell lung cancer through S-phase arrest and decreased base excision repair. *Clin Cancer Res* 29:4644–4659 (2023).
+- Love M.I., Huber W., Anders S. Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. *Genome Biol* 15:550 (2014).
+- Wu T. *et al.* clusterProfiler 4.0. *The Innovation* 2:100141 (2021).
+- Buenrostro J.D. *et al.* Transposition of native chromatin for fast and sensitive epigenomic profiling. *Nat Methods* 10:1213–1218 (2013).

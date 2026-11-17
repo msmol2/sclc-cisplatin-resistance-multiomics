@@ -109,7 +109,7 @@ counts <- counts[, -(1:5)]
 info   <- read.delim("PAGI_ATAC_samplesheet.txt")
 colnames(counts) <- info$Sample
 
-condition <- factor(info$Condition, levels = c("P", "CR"))
+condition <- factor(info$Condition)   # default alphabetical levels: CR is the reference
 treatment <- factor(info$Treatment, levels = c("Co", "RGFP", "Romi", "Vor"))
 
 y <- DGEList(counts)
@@ -119,12 +119,14 @@ y <- normLibSizes(y)                                           # TMM
 design <- model.matrix(~ treatment + condition)
 y   <- estimateDisp(y, design)
 fit <- glmQLFit(y, design)
-res <- glmQLFTest(fit, coef = "conditionCR")
+res <- glmQLFTest(fit, coef = "conditionP")   # log2(P/CR); see the note below
 tab <- topTags(res, n = Inf)$table
 write.csv(tab, "qc/DA_CR_vs_P.csv")
 
 plotMDS(y, col = ifelse(condition == "CR", "steelblue", "tomato"),
         pch = c(15, 16, 17, 18)[treatment])
 ```
+
+With default factor levels `CR` is the reference, so the tested coefficient is P vs CR: positive log2FC means more open in **parental**. The delivered table was labelled "CR vs P", and the group's DESeq2 cross-check (|r| = 0.95, opposite sign) caught the inversion. The default factor levels are the most likely cause. To get log2(CR/P) directly, use `factor(info$Condition, levels = c("P", "CR"))` and `coef = "conditionCR"`.
 
 `filterByExpr` with default settings kept only 69 peaks at this depth, so the simpler CPM filter above was used instead.
